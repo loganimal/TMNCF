@@ -9,3 +9,29 @@ Game description
 - They fight bad guys using their weapons
 - Each level has different bad guys, who are stronger. The number of bad guys also change, and the location changes. The levels become more complicated.
 - At some stages they enter a mini-boss level, where there is one main bad guy or more. Boss guy levels are set in temples
+
+Game controls: Arrow keys to move/jump, Space to attack.
+
+
+CHANGELOG
+=========
+
+v1.0.0 — Initial release (5 levels)
+- 4 playable crocodile characters with unique weapons
+- 5 platforming levels with basic enemies
+- Boss fight at Level 5 (150 HP, melee attack)
+- Noodle collection per level
+- Character select screen
+
+v1.1.0 — Extended adventure & boss improvements
+- NEW: Noodle score now persists across all levels (collect noodles throughout the whole game!)
+- NEW: Level 6 — "The Escape" — crumbling temple run with 3 enemies
+- NEW: Level 7 — "Shadow Swarm" — dark forest with 5 enemies
+- NEW: Level 8 — "The Final Boss" — throne room showdown
+- NEW: Final boss at Level 8 with crown, spikes, and 300 HP
+- IMPROVED: Level 5 boss is tougher (250 HP, faster movement, new ground-pound shockwave attack)
+- IMPROVED: Bosses enter an "angry" phase (glowing eyes, colour change) when low on health
+- IMPROVED: Beating Level 5 boss spawns an exit door instead of ending the game
+- IMPROVED: Victory screen shows total noodles from all 8 levels
+- IMPROVED: Each new level has its own background and platform theme
+- IMPROVED: HUD now shows Level X/8
