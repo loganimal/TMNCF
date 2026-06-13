@@ -41,10 +41,11 @@ let soundEnabled = true;
 const keys = {};
 document.addEventListener('keydown', (e) => {
     keys[e.code] = true;
-    if (gameState === 'PLAYING') {
-        if (e.code === 'Space') player.attack();
-        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.useAbility();
+    if (gameState === 'PLAYING' && player) {
+        if (e.code === 'Space') { e.preventDefault(); player.attack(); }
+        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') { e.preventDefault(); player.useAbility(); }
         if (e.code === 'KeyZ') player.shoot();
+        if (e.code === 'KeyG') { e.preventDefault(); player.godMode = !player.godMode; }
     }
 });
 document.addEventListener('keyup', (e) => {
@@ -134,7 +135,7 @@ class Player {
         this.maxHealth = 100;
         this.health = 100;
         this.noodles = 0;
-        this.lives = 3;
+        this.lives = 10;
         
         this.attacking = false;
         this.attackTimer = 0;
@@ -154,6 +155,7 @@ class Player {
         this.doubleJumped = false;
         this.canDoubleJump = false;
         this.platformVx = 0;
+        this.godMode = false;
     }
     
     isInWater() {
@@ -401,7 +403,7 @@ class Player {
     }
     
     takeDamage(amount) {
-        if (this.invincible) return;
+        if (this.invincible || this.godMode) return;
         SoundFX.hurt();
         this.health -= amount;
         this.invincible = true;
@@ -1638,6 +1640,11 @@ function drawHUD() {
         ctx.fillStyle = '#FFF';
         ctx.font = '10px monospace';
         ctx.fillText('DMG+', 94, yOff + 6);
+    }
+    if (player.godMode) {
+        ctx.fillStyle = 'rgba(255, 255, 0, 0.3)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        drawPixelText('GOD MODE', canvas.width / 2, canvas.height - 8, 14, '#FF0');
     }
 }
 

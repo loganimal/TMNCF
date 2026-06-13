@@ -10,7 +10,7 @@ Game description
 - Each level has different bad guys, who are stronger. The number of bad guys also change, and the location changes. The levels become more complicated.
 - At some stages they enter a mini-boss level, where there is one main bad guy or more. Boss guy levels are set in temples
 
-Game controls: Arrow keys to move/jump/swim up, Space to attack, Shift for special ability, Z to throw shuriken.
+Game controls: Arrow keys to move/jump/swim up, Space to attack, Shift for special ability, Z to throw shuriken, G to toggle God mode.
 
 
 CHANGELOG
@@ -54,3 +54,5 @@ v2.0.0 — Swimming, zombies, mutant boss & power-ups
 - IMPROVED: Basic enemy HP scales with level (tougher in later stages)
 - IMPROVED: Ability cooldown and power-up timers shown on HUD
 - IMPROVED: Controls now include Shift (ability) and Z (shuriken)
+- IMPROVED: Lives increased from 3 to 10 to balance difficulty
+- NEW: God mode toggle (press G) — makes you invincible, shows yellow overlay
