@@ -8,8 +8,25 @@ const ctx = canvas.getContext('2d');
 // Game constants
 const GRAVITY = 0.6;
 const JUMP_FORCE = -12;
-const MOVE_SPEED = 3;  // Reduced from 5 for smaller steps
+const MOVE_SPEED = 3;
 const TILE_SIZE = 40;
+
+// Swimming
+const WATER_GRAVITY = 0.15;
+const SWIM_FORCE = -6;
+const WATER_SPEED_MULT = 0.7;
+
+// Power-ups
+const POWERUP_SIZE = 20;
+const SPEED_BOOST_DURATION = 300;
+const DAMAGE_BOOST_DURATION = 300;
+const STAR_DURATION = 180;
+const ABILITY_COOLDOWN = 480;
+
+// Projectiles
+const MAX_PROJECTILES = 50;
+const PLAYER_PROJECTILE_SPEED = 6;
+const PLAYER_PROJECTILE_DAMAGE = 20;
 
 // Game state
 let gameState = 'CHARACTER_SELECT'; // CHARACTER_SELECT, PLAYING, PAUSED, GAME_OVER, VICTORY
@@ -17,13 +34,17 @@ let currentLevel = 0;
 let selectedCharacter = 0;
 let frameCount = 0;
 let totalNoodles = 0;
+let projectiles = [];
+let soundEnabled = true;
 
 // Input handling
 const keys = {};
 document.addEventListener('keydown', (e) => {
     keys[e.code] = true;
-    if (e.code === 'Space' && gameState === 'PLAYING') {
-        player.attack();
+    if (gameState === 'PLAYING') {
+        if (e.code === 'Space') player.attack();
+        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.useAbility();
+        if (e.code === 'KeyZ') player.shoot();
     }
 });
 document.addEventListener('keyup', (e) => {
@@ -39,6 +60,61 @@ const CHARACTERS = [
     { name: 'Techno', color: '#AA44AA', weapon: 'nunchucks', bandana: '#800080' },
     { name: 'Tanger', color: '#FFAA44', weapon: 'sais', bandana: '#FF8800' }
 ];
+
+// ============================================
+// SOUND FX (Web Audio API)
+// ============================================
+const SoundFX = {
+    _ctx: null,
+    _getCtx() {
+        if (!this._ctx) {
+            try { this._ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+        }
+        return this._ctx;
+    },
+    _playTone(freq, duration, type = 'square', volume = 0.1) {
+        const ctx = this._getCtx();
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        gain.gain.setValueAtTime(volume, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + duration);
+    },
+    _playSweep(startFreq, endFreq, duration, type = 'square', volume = 0.1) {
+        const ctx = this._getCtx();
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(startFreq, ctx.currentTime);
+        osc.frequency.linearRampToValueAtTime(endFreq, ctx.currentTime + duration);
+        gain.gain.setValueAtTime(volume, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(ctx.currentTime);
+        osc.stop(ctx.currentTime + duration);
+    },
+    jump() { this._playSweep(200, 400, 0.1, 'square', 0.08); },
+    attack() { this._playTone(150, 0.05, 'sawtooth', 0.06); },
+    hurt() { this._playTone(100, 0.12, 'sawtooth', 0.1); },
+    collect() { this._playSweep(500, 800, 0.1, 'square', 0.08); },
+    enemyDeath() { this._playSweep(400, 100, 0.2, 'sawtooth', 0.08); },
+    powerup() { this._playSweep(300, 900, 0.15, 'square', 0.1); },
+    ability() { this._playSweep(200, 600, 0.2, 'sawtooth', 0.08); },
+    victory() {
+        this._playSweep(400, 600, 0.15, 'square', 0.1);
+        setTimeout(() => this._playSweep(500, 700, 0.15, 'square', 0.1), 150);
+        setTimeout(() => this._playSweep(600, 900, 0.3, 'square', 0.1), 300);
+    },
+    splash() { this._playTone(300, 0.08, 'sine', 0.05); }
+};
 
 // ============================================
 // PLAYER CLASS
@@ -66,53 +142,96 @@ class Player {
         this.invincibleTimer = 0;
         
         this.animFrame = 0;
+        
+        this.inWater = false;
+        this.wasInWater = false;
+        this.speedBoostTimer = 0;
+        this.damageBoostTimer = 0;
+        this.hasShuriken = false;
+        this.shurikenCooldown = 0;
+        this.abilityCooldown = 0;
+        this.abilityReady = true;
+        this.doubleJumped = false;
+        this.canDoubleJump = false;
+        this.platformVx = 0;
+    }
+    
+    isInWater() {
+        if (!currentLevelData.water) return false;
+        for (let w of currentLevelData.water) {
+            if (this.x + this.width > w.x && this.x < w.x + w.width &&
+                this.y + this.height > w.y && this.y < w.y + w.height) {
+                return true;
+            }
+        }
+        return false;
     }
     
     update() {
-        // Animation
         this.animFrame++;
+        this.wasInWater = this.inWater;
+        this.inWater = this.isInWater();
         
-        // Movement
+        if (this.inWater && !this.wasInWater) SoundFX.splash();
+        
+        let speed = MOVE_SPEED;
+        if (this.speedBoostTimer > 0) speed *= 1.5;
+        if (this.inWater) speed *= WATER_SPEED_MULT;
+        
         if (keys['ArrowLeft']) {
-            this.vx = -MOVE_SPEED;
+            this.vx = -speed;
             this.facingRight = false;
         } else if (keys['ArrowRight']) {
-            this.vx = MOVE_SPEED;
+            this.vx = speed;
             this.facingRight = true;
         } else {
             this.vx *= 0.8;
         }
         
-        // Jumping (Up arrow)
-        if (keys['ArrowUp'] && this.grounded) {
-            this.vy = JUMP_FORCE;
-            this.grounded = false;
+        if (this.grounded) {
+            this.vx += this.platformVx;
+            this.platformVx = 0;
         }
         
-        // Apply gravity
-        this.vy += GRAVITY;
+        if (keys['ArrowUp']) {
+            if (this.inWater) {
+                this.vy = SWIM_FORCE;
+                this.grounded = false;
+            } else if (this.grounded) {
+                this.vy = JUMP_FORCE;
+                this.grounded = false;
+                SoundFX.jump();
+            } else if (this.canDoubleJump && !this.doubleJumped) {
+                this.vy = JUMP_FORCE * 0.85;
+                this.doubleJumped = true;
+                SoundFX.jump();
+            }
+        }
         
-        // Update position
+        if (this.inWater) {
+            this.vy += WATER_GRAVITY;
+            if (this.vy > 3) this.vy = 3;
+        } else {
+            this.vy += GRAVITY;
+        }
+        
         this.x += this.vx;
         this.y += this.vy;
         
-        // Check platform collisions
+        // Platform collisions
         this.grounded = false;
         for (let platform of currentLevelData.platforms) {
             if (this.checkCollision(platform)) {
-                // Landing on top
                 if (this.vy > 0 && this.y < platform.y) {
                     this.y = platform.y - this.height;
                     this.vy = 0;
                     this.grounded = true;
-                }
-                // Hitting from below
-                else if (this.vy < 0 && this.y > platform.y) {
+                    this.doubleJumped = false;
+                    if (platform.vx) this.platformVx = platform.vx;
+                } else if (this.vy < 0 && this.y > platform.y) {
                     this.y = platform.y + platform.height;
                     this.vy = 0;
-                }
-                // Hitting from side
-                else if (this.vx > 0) {
+                } else if (this.vx > 0) {
                     this.x = platform.x - this.width;
                     this.vx = 0;
                 } else if (this.vx < 0) {
@@ -122,45 +241,132 @@ class Player {
             }
         }
         
-        // Screen boundaries
+        // Screen bounds
         if (this.x < 0) this.x = 0;
         if (this.x > canvas.width - this.width) this.x = canvas.width - this.width;
+        
+        // Water surface clamp
+        if (this.inWater && currentLevelData.water) {
+            for (let w of currentLevelData.water) {
+                if (this.y < w.y - 10) { this.y = w.y - 10; this.vy = 0; }
+            }
+        }
+        
         if (this.y > canvas.height) {
             this.takeDamage(25);
             this.respawn();
         }
         
-        // Attack timer
+        // Timers
         if (this.attacking) {
             this.attackTimer--;
-            if (this.attackTimer <= 0) {
-                this.attacking = false;
-            }
+            if (this.attackTimer <= 0) this.attacking = false;
         }
-        
-        // Invincibility timer
         if (this.invincible) {
             this.invincibleTimer--;
-            if (this.invincibleTimer <= 0) {
-                this.invincible = false;
-            }
+            if (this.invincibleTimer <= 0) this.invincible = false;
+        }
+        if (this.speedBoostTimer > 0) this.speedBoostTimer--;
+        if (this.damageBoostTimer > 0) this.damageBoostTimer--;
+        if (this.shurikenCooldown > 0) this.shurikenCooldown--;
+        if (this.abilityCooldown > 0) {
+            this.abilityCooldown--;
+            if (this.abilityCooldown <= 0) this.abilityReady = true;
         }
         
-        // Check noodle collection
+        // Noodle collection
         for (let i = currentLevelData.noodles.length - 1; i >= 0; i--) {
             let noodle = currentLevelData.noodles[i];
             if (this.checkCollision(noodle)) {
                 this.noodles++;
-                if (this.noodles % 10 === 0) {
-                    this.lives++;
-                }
                 currentLevelData.noodles.splice(i, 1);
+                SoundFX.collect();
+                if (this.noodles % 10 === 0) this.lives++;
             }
         }
         
-        // Check level exit
+        // Power-up collection
+        if (currentLevelData.powerups) {
+            for (let i = currentLevelData.powerups.length - 1; i >= 0; i--) {
+                let pu = currentLevelData.powerups[i];
+                if (this.x < pu.x + POWERUP_SIZE && this.x + this.width > pu.x &&
+                    this.y < pu.y + POWERUP_SIZE && this.y + this.height > pu.y) {
+                    this.applyPowerup(pu.type);
+                    currentLevelData.powerups.splice(i, 1);
+                    SoundFX.powerup();
+                }
+            }
+        }
+        
+        // Hazard collision
+        if (currentLevelData.hazards) {
+            for (let hazard of currentLevelData.hazards) {
+                if (this.checkCollision(hazard)) this.takeDamage(30);
+            }
+        }
+        
+        // Level exit
         if (currentLevelData.exit && this.checkCollision(currentLevelData.exit)) {
             nextLevel();
+        }
+    }
+    
+    applyPowerup(type) {
+        switch (type) {
+            case 'steak': this.health = Math.min(this.maxHealth, this.health + 30); break;
+            case 'speed': this.speedBoostTimer = SPEED_BOOST_DURATION; break;
+            case 'damage': this.damageBoostTimer = DAMAGE_BOOST_DURATION; break;
+            case 'star': this.invincible = true; this.invincibleTimer = STAR_DURATION; break;
+            case 'shuriken': this.hasShuriken = true; break;
+        }
+    }
+    
+    useAbility() {
+        if (!this.abilityReady) return;
+        this.abilityReady = false;
+        this.abilityCooldown = ABILITY_COOLDOWN;
+        SoundFX.ability();
+        switch (this.character.weapon) {
+            case 'staff':
+                if (this.grounded) {
+                    for (let e of currentLevelData.enemies) {
+                        if (!e.dead && Math.abs(e.x - this.x) < 150) e.takeDamage(30);
+                    }
+                }
+                break;
+            case 'swords':
+                this.canDoubleJump = true;
+                this.doubleJumped = false;
+                if (!this.grounded) { this.vy = JUMP_FORCE * 0.85; this.doubleJumped = true; }
+                break;
+            case 'nunchucks':
+                this.x += (this.facingRight ? 1 : -1) * 120;
+                if (this.x < 0) this.x = 0;
+                if (this.x > canvas.width - this.width) this.x = canvas.width - this.width;
+                break;
+            case 'sais':
+                for (let e of currentLevelData.enemies) {
+                    if (!e.dead && Math.abs(e.x - this.x) < 100) { e.stunned = true; e.stunTimer = 60; }
+                }
+                for (let i = projectiles.length - 1; i >= 0; i--) {
+                    if (projectiles[i].isEnemy && Math.abs(projectiles[i].x - this.x) < 120) {
+                        projectiles[i].vx *= -1; projectiles[i].isEnemy = false;
+                    }
+                }
+                break;
+        }
+    }
+    
+    shoot() {
+        if (!this.hasShuriken || this.shurikenCooldown > 0) return;
+        this.shurikenCooldown = 30;
+        let dir = this.facingRight ? 1 : -1;
+        if (projectiles.length < MAX_PROJECTILES) {
+            projectiles.push(new Projectile(
+                this.x + (this.facingRight ? this.width : 0),
+                this.y + this.height / 2,
+                PLAYER_PROJECTILE_SPEED * dir, 0, false, PLAYER_PROJECTILE_DAMAGE
+            ));
         }
     }
     
@@ -175,41 +381,35 @@ class Player {
         if (!this.attacking) {
             this.attacking = true;
             this.attackTimer = 15;
-            
-            // Check enemy hits
+            SoundFX.attack();
             let attackRange = {
                 x: this.facingRight ? this.x + this.width : this.x - 40,
-                y: this.y,
-                width: 40,
-                height: this.height
+                y: this.y, width: 40, height: this.height
             };
-            
             for (let enemy of currentLevelData.enemies) {
-                if (!enemy.dead && 
+                if (!enemy.dead &&
                     attackRange.x < enemy.x + enemy.width &&
                     attackRange.x + attackRange.width > enemy.x &&
                     attackRange.y < enemy.y + enemy.height &&
                     attackRange.y + attackRange.height > enemy.y) {
-                    enemy.takeDamage(34);
+                    let dmg = 34;
+                    if (this.damageBoostTimer > 0) dmg *= 2;
+                    enemy.takeDamage(dmg);
                 }
             }
         }
     }
     
     takeDamage(amount) {
-        if (!this.invincible) {
-            this.health -= amount;
-            this.invincible = true;
-            this.invincibleTimer = 60;
-            if (this.health <= 0) {
-                this.lives--;
-                if (this.lives > 0) {
-                    this.health = this.maxHealth;
-                    this.respawn();
-                } else {
-                    gameState = 'GAME_OVER';
-                }
-            }
+        if (this.invincible) return;
+        SoundFX.hurt();
+        this.health -= amount;
+        this.invincible = true;
+        this.invincibleTimer = 60;
+        if (this.health <= 0) {
+            this.lives--;
+            if (this.lives > 0) { this.health = this.maxHealth; this.respawn(); }
+            else { gameState = 'GAME_OVER'; }
         }
     }
     
@@ -218,225 +418,214 @@ class Player {
         this.y = currentLevelData.startY;
         this.vx = 0;
         this.vy = 0;
+        this.inWater = false;
     }
     
     draw() {
-        // Flicker when invincible
         if (this.invincible && Math.floor(this.animFrame / 4) % 2 === 0) return;
-        
         ctx.save();
+        let swimBob = this.inWater ? Math.sin(this.animFrame * 0.08) * 3 : 0;
+        let dy = this.y + swimBob;
+        let tailWag = (Math.abs(this.vx) > 0.1 || this.inWater) ? Math.sin(this.animFrame * 0.4) * 8 : 0;
         
-        // Tail (wags when moving)
-        let tailWag = Math.abs(this.vx) > 0.1 ? Math.sin(this.animFrame * 0.4) * 8 : 0;
         ctx.fillStyle = '#1a6b1a';
         ctx.beginPath();
-        let tailX = this.facingRight ? this.x : this.x + this.width;
-        ctx.moveTo(this.x + 4, this.y + 28);
-        ctx.lineTo(this.x - 12, this.y + 24 + tailWag);
-        ctx.lineTo(this.x - 8, this.y + 32 + tailWag);
-        ctx.lineTo(this.x + 4, this.y + 36);
+        ctx.moveTo(this.x + 4, dy + 28);
+        ctx.lineTo(this.x - 12, dy + 24 + tailWag);
+        ctx.lineTo(this.x - 8, dy + 32 + tailWag);
+        ctx.lineTo(this.x + 4, dy + 36);
         ctx.fill();
         
-        // Body (green crocodile) - wider, more croc-like
         ctx.fillStyle = '#228B22';
-        ctx.fillRect(this.x + 2, this.y + 14, 28, 26);
-        // Scales on back
+        ctx.fillRect(this.x + 2, dy + 14, 28, 26);
         ctx.fillStyle = '#1a6b1a';
-        ctx.fillRect(this.x + 6, this.y + 16, 4, 4);
-        ctx.fillRect(this.x + 14, this.y + 18, 4, 4);
-        ctx.fillRect(this.x + 22, this.y + 16, 4, 4);
-        ctx.fillRect(this.x + 10, this.y + 26, 4, 4);
-        ctx.fillRect(this.x + 18, this.y + 28, 4, 4);
-        
-        // Belly (lighter green)
+        ctx.fillRect(this.x + 6, dy + 16, 4, 4); ctx.fillRect(this.x + 14, dy + 18, 4, 4);
+        ctx.fillRect(this.x + 22, dy + 16, 4, 4); ctx.fillRect(this.x + 10, dy + 26, 4, 4);
+        ctx.fillRect(this.x + 18, dy + 28, 4, 4);
         ctx.fillStyle = '#90EE90';
-        ctx.fillRect(this.x + 8, this.y + 30, 16, 8);
+        ctx.fillRect(this.x + 8, dy + 30, 16, 8);
         
-        // Head - crocodile snout shape
         ctx.fillStyle = '#228B22';
-        // Main head
-        ctx.fillRect(this.x + (this.facingRight ? 12 : -4), this.y + 2, 24, 16);
-        // Snout extension
-        ctx.fillRect(this.x + (this.facingRight ? 28 : -12), this.y + 6, 14, 10);
-        
-        // Eyes (on top of head like real crocs)
+        ctx.fillRect(this.x + (this.facingRight ? 12 : -4), dy + 2, 24, 16);
+        ctx.fillRect(this.x + (this.facingRight ? 28 : -12), dy + 6, 14, 10);
         ctx.fillStyle = '#FFF';
-        ctx.fillRect(this.x + (this.facingRight ? 20 : 4), this.y, 6, 6);
+        ctx.fillRect(this.x + (this.facingRight ? 20 : 4), dy, 6, 6);
         ctx.fillStyle = '#000';
-        ctx.fillRect(this.x + (this.facingRight ? 22 : 6), this.y + 2, 3, 3);
-        // Eyebrow ridge
+        ctx.fillRect(this.x + (this.facingRight ? 22 : 6), dy + 2, 3, 3);
         ctx.fillStyle = '#1a6b1a';
-        ctx.fillRect(this.x + (this.facingRight ? 18 : 2), this.y - 2, 10, 3);
-        
-        // Teeth
+        ctx.fillRect(this.x + (this.facingRight ? 18 : 2), dy - 2, 10, 3);
         ctx.fillStyle = '#FFF';
         for (let i = 0; i < 3; i++) {
-            let toothX = this.x + (this.facingRight ? 32 + i * 4 : -6 - i * 4);
-            ctx.fillRect(toothX, this.y + 14, 2, 4);
+            let tx = this.x + (this.facingRight ? 32 + i * 4 : -6 - i * 4);
+            ctx.fillRect(tx, dy + 14, 2, 4);
         }
-        
-        // Nostrils
         ctx.fillStyle = '#0F0';
-        ctx.fillRect(this.x + (this.facingRight ? 38 : -8), this.y + 8, 2, 2);
+        ctx.fillRect(this.x + (this.facingRight ? 38 : -8), dy + 8, 2, 2);
         
-        // Bandana (wrapped around neck)
         ctx.fillStyle = this.character.bandana;
-        ctx.fillRect(this.x - 2, this.y + 12, 36, 8);
-        // Bandana tails that flow when moving
-        let tailFlow = this.facingRight ? -1 : 1;
-        let tailWave = Math.sin(this.animFrame * 0.3) * 3;
-        ctx.fillRect(this.x + (this.facingRight ? -10 : 26), this.y + 14 + tailWave, 10, 5);
-        ctx.fillRect(this.x + (this.facingRight ? -8 : 28), this.y + 18 - tailWave, 8, 4);
+        ctx.fillRect(this.x - 2, dy + 12, 36, 8);
+        let tw = Math.sin(this.animFrame * 0.3) * 3;
+        ctx.fillRect(this.x + (this.facingRight ? -10 : 26), dy + 14 + tw, 10, 5);
+        ctx.fillRect(this.x + (this.facingRight ? -8 : 28), dy + 18 - tw, 8, 4);
         
-        // WEAPON ATTACK ANIMATIONS
         if (this.attacking) {
-            let attackProgress = 1 - (this.attackTimer / 15); // 0 to 1
-            
+            let ap = 1 - (this.attackTimer / 15);
             if (this.character.weapon === 'staff') {
-                // Staff sweep animation
-                ctx.fillStyle = '#8B4513';
-                ctx.save();
-                ctx.translate(this.x + (this.facingRight ? 24 : 8), this.y + 20);
-                ctx.rotate((this.facingRight ? 1 : -1) * (-Math.PI/3 + attackProgress * Math.PI*1.5));
+                ctx.fillStyle = '#8B4513'; ctx.save();
+                ctx.translate(this.x + (this.facingRight ? 24 : 8), dy + 20);
+                ctx.rotate((this.facingRight ? 1 : -1) * (-Math.PI/3 + ap * Math.PI*1.5));
                 ctx.fillRect(-2, -24, 4, 48);
-                // Gold tip
-                ctx.fillStyle = '#FFD700';
-                ctx.fillRect(-3, -28, 6, 6);
-                ctx.restore();
-                
+                ctx.fillStyle = '#FFD700'; ctx.fillRect(-3, -28, 6, 6); ctx.restore();
             } else if (this.character.weapon === 'swords') {
-                // Dual sword slash
-                ctx.fillStyle = '#C0C0C0';
-                ctx.save();
-                ctx.translate(this.x + (this.facingRight ? 24 : 8), this.y + 18);
-                ctx.rotate((this.facingRight ? 1 : -1) * (attackProgress * Math.PI));
-                // Sword 1
-                ctx.fillRect(0, -20, 4, 28);
-                ctx.fillStyle = '#8B0000';
-                ctx.fillRect(-2, 4, 8, 4); // handle
-                // Sword 2
-                ctx.fillStyle = '#C0C0C0';
-                ctx.fillRect(10, -20, 4, 28);
-                ctx.fillStyle = '#8B0000';
-                ctx.fillRect(8, 4, 8, 4); // handle
-                ctx.restore();
-                
+                ctx.fillStyle = '#C0C0C0'; ctx.save();
+                ctx.translate(this.x + (this.facingRight ? 24 : 8), dy + 18);
+                ctx.rotate((this.facingRight ? 1 : -1) * (ap * Math.PI));
+                ctx.fillRect(0, -20, 4, 28); ctx.fillStyle = '#8B0000'; ctx.fillRect(-2, 4, 8, 4);
+                ctx.fillStyle = '#C0C0C0'; ctx.fillRect(10, -20, 4, 28);
+                ctx.fillStyle = '#8B0000'; ctx.fillRect(8, 4, 8, 4); ctx.restore();
             } else if (this.character.weapon === 'nunchucks') {
-                // Spinning nunchucks
-                ctx.fillStyle = '#8B4513';
-                let spinAngle = attackProgress * Math.PI * 4;
-                let stickX = this.x + (this.facingRight ? 32 : 0);
-                let stickY = this.y + 20;
-                // Chain
-                for (let i = 0; i < 4; i++) {
-                    let chainAngle = spinAngle + i * 0.5;
-                    let cx = stickX + Math.cos(chainAngle) * (8 + i * 6);
-                    let cy = stickY + Math.sin(chainAngle) * 15;
-                    ctx.fillStyle = '#444';
-                    ctx.fillRect(cx - 2, cy - 2, 4, 4);
-                }
-                // Main stick
-                ctx.fillStyle = '#8B4513';
-                ctx.fillRect(stickX - 4, stickY - 3, 8, 6);
-                ctx.fillStyle = '#FFD700';
-                ctx.fillRect(stickX - 6, stickY - 4, 4, 8);
-                // Spinning stick
-                let endX = stickX + Math.cos(spinAngle) * 30;
-                let endY = stickY + Math.sin(spinAngle) * 20;
-                ctx.fillStyle = '#8B4513';
-                ctx.save();
-                ctx.translate(endX, endY);
-                ctx.rotate(spinAngle);
-                ctx.fillRect(-4, -3, 10, 6);
-                ctx.restore();
-                
+                ctx.fillStyle = '#8B4513'; let sa = ap * Math.PI * 4;
+                let sx = this.x + (this.facingRight ? 32 : 0), sy = dy + 20;
+                for (let i = 0; i < 4; i++) { let ca = sa + i * 0.5;
+                    ctx.fillStyle = '#444'; ctx.fillRect(sx+Math.cos(ca)*(8+i*6)-2, sy+Math.sin(ca)*15-2, 4, 4); }
+                ctx.fillStyle = '#8B4513'; ctx.fillRect(sx - 4, sy - 3, 8, 6);
+                ctx.fillStyle = '#FFD700'; ctx.fillRect(sx - 6, sy - 4, 4, 8);
+                ctx.fillStyle = '#8B4513'; ctx.save();
+                ctx.translate(sx + Math.cos(sa)*30, sy + Math.sin(sa)*20); ctx.rotate(sa);
+                ctx.fillRect(-4, -3, 10, 6); ctx.restore();
             } else if (this.character.weapon === 'sais') {
-                // Stabbing motion with sais
-                ctx.fillStyle = '#C0C0C0';
-                let stabOffset = Math.sin(attackProgress * Math.PI) * 20;
-                let saiX = this.x + (this.facingRight ? 28 + stabOffset : 4 - stabOffset);
-                let saiY = this.y + 16;
-                // Main blade
-                ctx.fillRect(saiX, saiY - 20, 3, 24);
-                // Side prongs
-                ctx.beginPath();
-                ctx.moveTo(saiX - 1, saiY - 15);
-                ctx.lineTo(saiX - 6, saiY - 8);
-                ctx.lineTo(saiX - 1, saiY - 8);
-                ctx.fill();
-                ctx.beginPath();
-                ctx.moveTo(saiX + 4, saiY - 15);
-                ctx.lineTo(saiX + 9, saiY - 8);
-                ctx.lineTo(saiX + 4, saiY - 8);
-                ctx.fill();
-                // Handle
-                ctx.fillStyle = '#333';
-                ctx.fillRect(saiX - 1, saiY, 5, 8);
-                // Second sai
-                ctx.fillStyle = '#C0C0C0';
-                ctx.fillRect(saiX + 8, saiY - 16, 3, 22);
-                ctx.beginPath();
-                ctx.moveTo(saiX + 7, saiY - 12);
-                ctx.lineTo(saiX + 2, saiY - 6);
-                ctx.lineTo(saiX + 7, saiY - 6);
-                ctx.fill();
-                ctx.beginPath();
-                ctx.moveTo(saiX + 12, saiY - 12);
-                ctx.lineTo(saiX + 17, saiY - 6);
-                ctx.lineTo(saiX + 12, saiY - 6);
-                ctx.fill();
-                ctx.fillStyle = '#333';
-                ctx.fillRect(saiX + 7, saiY + 2, 5, 8);
+                ctx.fillStyle = '#C0C0C0'; let so = Math.sin(ap * Math.PI) * 20;
+                let sx = this.x + (this.facingRight ? 28 + so : 4 - so);
+                ctx.fillRect(sx, dy + 16 - 20, 3, 24);
+                ctx.beginPath(); ctx.moveTo(sx - 1, dy + 16 - 15); ctx.lineTo(sx - 6, dy + 16 - 8); ctx.lineTo(sx - 1, dy + 16 - 8); ctx.fill();
+                ctx.beginPath(); ctx.moveTo(sx + 4, dy + 16 - 15); ctx.lineTo(sx + 9, dy + 16 - 8); ctx.lineTo(sx + 4, dy + 16 - 8); ctx.fill();
+                ctx.fillStyle = '#333'; ctx.fillRect(sx - 1, dy + 16, 5, 8);
+                ctx.fillStyle = '#C0C0C0'; ctx.fillRect(sx + 8, dy + 16 - 16, 3, 22);
+                ctx.beginPath(); ctx.moveTo(sx + 7, dy + 16 - 12); ctx.lineTo(sx + 2, dy + 16 - 6); ctx.lineTo(sx + 7, dy + 16 - 6); ctx.fill();
+                ctx.beginPath(); ctx.moveTo(sx + 12, dy + 16 - 12); ctx.lineTo(sx + 17, dy + 16 - 6); ctx.lineTo(sx + 12, dy + 16 - 6); ctx.fill();
+                ctx.fillStyle = '#333'; ctx.fillRect(sx + 7, dy + 16 + 2, 5, 8);
             }
         } else {
-            // Weapon at rest
             ctx.fillStyle = '#8B4513';
             if (this.character.weapon === 'staff') {
-                ctx.fillRect(this.x + 10, this.y + 4, 3, 28);
-                ctx.fillStyle = '#FFD700';
-                ctx.fillRect(this.x + 9, this.y + 2, 5, 4);
+                ctx.fillRect(this.x + 10, dy + 4, 3, 28);
+                ctx.fillStyle = '#FFD700'; ctx.fillRect(this.x + 9, dy + 2, 5, 4);
             } else if (this.character.weapon === 'swords') {
                 ctx.fillStyle = '#C0C0C0';
-                ctx.fillRect(this.x + 8, this.y + 6, 2, 18);
-                ctx.fillRect(this.x + 12, this.y + 6, 2, 18);
-                ctx.fillStyle = '#8B0000';
-                ctx.fillRect(this.x + 6, this.y + 20, 10, 3);
+                ctx.fillRect(this.x + 8, dy + 6, 2, 18); ctx.fillRect(this.x + 12, dy + 6, 2, 18);
+                ctx.fillStyle = '#8B0000'; ctx.fillRect(this.x + 6, dy + 20, 10, 3);
             } else if (this.character.weapon === 'nunchucks') {
-                ctx.fillStyle = '#8B4513';
-                ctx.fillRect(this.x + 22, this.y + 8, 4, 8);
-                ctx.fillRect(this.x + 26, this.y + 10, 3, 6);
+                ctx.fillStyle = '#8B4513'; ctx.fillRect(this.x + 22, dy + 8, 4, 8);
+                ctx.fillRect(this.x + 26, dy + 10, 3, 6);
             } else if (this.character.weapon === 'sais') {
-                ctx.fillStyle = '#C0C0C0';
-                ctx.fillRect(this.x + 22, this.y + 8, 2, 12);
-                ctx.fillRect(this.x + 26, this.y + 10, 2, 10);
+                ctx.fillStyle = '#C0C0C0'; ctx.fillRect(this.x + 22, dy + 8, 2, 12);
+                ctx.fillRect(this.x + 26, dy + 10, 2, 10);
             }
         }
         
-        // Arms
         ctx.fillStyle = '#228B22';
-        let armOffset = Math.sin(this.animFrame * 0.2) * 3;
-        if (Math.abs(this.vx) > 0.1) {
-            ctx.fillRect(this.x + (this.attacking ? 4 : 2), this.y + 18 + armOffset, 6, 10);
-            ctx.fillRect(this.x + 24, this.y + 18 - armOffset, 6, 10);
-        } else {
-            ctx.fillRect(this.x + 4, this.y + 20, 6, 8);
-            ctx.fillRect(this.x + 22, this.y + 20, 6, 8);
+        let armOff = Math.sin(this.animFrame * 0.2) * 3;
+        ctx.fillRect(this.x + 2, dy + 18 + armOff, 6, 10);
+        ctx.fillRect(this.x + 24, dy + 18 - armOff, 6, 10);
+        
+        let legAnim = Math.abs(this.vx) > 0.1 ? Math.sin(this.animFrame * 0.3) * 6 : 0;
+        if (this.inWater) legAnim = Math.sin(this.animFrame * 0.15) * 4;
+        ctx.fillStyle = '#228B22';
+        ctx.fillRect(this.x + 4, dy + 36 + legAnim, 10, 10 - legAnim);
+        ctx.fillRect(this.x + 18, dy + 36 - legAnim, 10, 10 + legAnim);
+        ctx.fillStyle = '#444';
+        ctx.fillRect(this.x + 4, dy + 44, 2, 4); ctx.fillRect(this.x + 8, dy + 44, 2, 4);
+        ctx.fillRect(this.x + 20, dy + 44, 2, 4); ctx.fillRect(this.x + 24, dy + 44, 2, 4);
+        
+        if (this.damageBoostTimer > 0 || this.speedBoostTimer > 0 || this.invincible) {
+            ctx.fillStyle = this.invincible ? 'rgba(255,255,0,0.15)' :
+                this.damageBoostTimer > 0 ? 'rgba(255,0,0,0.15)' : 'rgba(0,255,255,0.15)';
+            ctx.fillRect(this.x - 4, this.y - 4, this.width + 8, this.height + 8);
+        }
+        ctx.restore();
+    }
+}
+
+// ============================================
+// PROJECTILE CLASS
+// ============================================
+class Projectile {
+    constructor(x, y, vx, vy, isEnemy = false, damage = 15) {
+        this.x = x;
+        this.y = y;
+        this.width = 8;
+        this.height = 8;
+        this.vx = vx;
+        this.vy = vy;
+        this.isEnemy = isEnemy;
+        this.damage = damage;
+        this.dead = false;
+        this.animFrame = 0;
+    }
+    
+    update() {
+        if (this.dead) return;
+        this.animFrame++;
+        this.x += this.vx;
+        this.y += this.vy;
+        this.vy += 0.1;
+        
+        // Remove if off screen
+        if (this.x < -50 || this.x > canvas.width + 50 || this.y < -50 || this.y > canvas.height + 50) {
+            this.dead = true;
+            return;
         }
         
-        // Legs (crocodile legs with claws)
-        let legOffset = Math.abs(this.vx) > 0.1 ? Math.sin(this.animFrame * 0.3) * 6 : 0;
-        ctx.fillStyle = '#228B22';
-        // Left leg
-        ctx.fillRect(this.x + 4, this.y + 36 + legOffset, 10, 10 - legOffset);
-        // Right leg  
-        ctx.fillRect(this.x + 18, this.y + 36 - legOffset, 10, 10 + legOffset);
-        // Claws
-        ctx.fillStyle = '#444';
-        ctx.fillRect(this.x + 4, this.y + 44, 2, 4);
-        ctx.fillRect(this.x + 8, this.y + 44, 2, 4);
-        ctx.fillRect(this.x + 20, this.y + 44, 2, 4);
-        ctx.fillRect(this.x + 24, this.y + 44, 2, 4);
+        // Platform collision
+        for (let platform of currentLevelData.platforms) {
+            if (this.x < platform.x + platform.width &&
+                this.x + this.width > platform.x &&
+                this.y < platform.y + platform.height &&
+                this.y + this.height > platform.y) {
+                this.dead = true;
+                return;
+            }
+        }
         
+        // Hit player (enemy projectiles)
+        if (this.isEnemy && player && player.checkCollision(this)) {
+            player.takeDamage(this.damage);
+            this.dead = true;
+            return;
+        }
+        
+        // Hit enemies (player projectiles)
+        if (!this.isEnemy) {
+            for (let enemy of currentLevelData.enemies) {
+                if (!enemy.dead && !enemy.stunned &&
+                    this.x < enemy.x + enemy.width &&
+                    this.x + this.width > enemy.x &&
+                    this.y < enemy.y + enemy.height &&
+                    this.y + this.height > enemy.y) {
+                    enemy.takeDamage(this.damage);
+                    this.dead = true;
+                    return;
+                }
+            }
+        }
+    }
+    
+    draw() {
+        if (this.dead) return;
+        ctx.save();
+        if (this.isEnemy) {
+            ctx.fillStyle = '#7B00FF';
+            ctx.fillRect(this.x, this.y, this.width, this.height);
+            ctx.fillStyle = '#AA44FF';
+            ctx.fillRect(this.x + 1, this.y + 1, this.width - 2, this.height - 2);
+        } else {
+            let spin = Math.sin(this.animFrame * 0.3) * 4;
+            ctx.fillStyle = '#FFD700';
+            ctx.fillRect(this.x + spin, this.y, 4, this.height);
+            ctx.fillRect(this.x + 2, this.y - 2, 4, this.height + 4);
+            ctx.fillStyle = '#FFA500';
+            ctx.fillRect(this.x + spin + 1, this.y + 1, 2, this.height - 2);
+        }
         ctx.restore();
     }
 }
@@ -449,20 +638,10 @@ class Enemy {
         this.x = x;
         this.y = y;
         this.startX = x;
-        this.width = type === 'finalboss' ? 56 : 32;
-        this.height = type === 'finalboss' ? 64 : (type === 'boss' ? 56 : 40);
         this.type = type;
-        this.vx = (type === 'boss' || type === 'finalboss') ? 0 : 1;
+        this.vx = 0;
         this.vy = 0;
         this.patrolDistance = 100;
-        if (type === 'finalboss') {
-            this.health = 300;
-        } else if (type === 'boss') {
-            this.health = 250;
-        } else {
-            this.health = 50;
-        }
-        this.maxHealth = this.health;
         this.dead = false;
         this.animFrame = 0;
         this.attackCooldown = 0;
@@ -470,73 +649,191 @@ class Enemy {
         this.groundPoundCooldown = 0;
         this.groundPounding = false;
         this._victoryTriggered = false;
+        this.stunned = false;
+        this.stunTimer = 0;
+        this.shootCooldown = 0;
+        
+        switch (type) {
+            case 'basic':
+                this.width = 32; this.height = 40;
+                this.health = 50; this.vx = 1;
+                break;
+            case 'zombie':
+                this.width = 32; this.height = 44;
+                this.health = 70; this.vx = 0;
+                this.resurrectionTimer = 0;
+                break;
+            case 'shooter':
+                this.width = 32; this.height = 40;
+                this.health = 40; this.vx = 0;
+                this.shootCooldown = 60 + Math.random() * 60;
+                break;
+            case 'boss':
+                this.width = 48; this.height = 56;
+                this.health = 300; this.vx = 0;
+                break;
+            case 'finalboss':
+                this.width = 56; this.height = 64;
+                this.health = 400; this.vx = 0;
+                this.charging = false;
+                this.chargeCooldown = 0;
+                this.chargeTimer = 0;
+                break;
+        }
+        this.maxHealth = this.health;
+        
+        // Difficulty scaling: later levels get tougher basics
+        let levelIdx = currentLevel || 0;
+        if (type === 'basic' && levelIdx >= 2) this.health += 10 * Math.min(levelIdx - 1, 4);
+        if (type === 'zombie' && levelIdx >= 9) this.health += 20;
+        if (type === 'shooter' && levelIdx >= 9) this.shootCooldown = Math.max(30, this.shootCooldown - 20);
+        this.maxHealth = this.health;
     }
     
     update() {
-        if (this.dead) return;
+        if (this.dead) {
+            // Zombie resurrection
+            if (this.type === 'zombie' && this.resurrectionTimer > 0) {
+                this.resurrectionTimer--;
+                if (this.resurrectionTimer <= 0) {
+                    // Check if player is nearby - if so, permanently dead
+                    let dist = player ? Math.abs(player.x - this.x) : 999;
+                    if (dist > 100) {
+                        this.dead = false;
+                        this.health = Math.floor(this.maxHealth * 0.5);
+                        this.vx = 0;
+                        this.animFrame = 0;
+                    }
+                }
+            }
+            return;
+        }
+        
+        if (this.stunned) {
+            this.stunTimer--;
+            if (this.stunTimer <= 0) this.stunned = false;
+            return;
+        }
         
         this.animFrame++;
         
-        // Patrol behavior for non-boss enemies
-        if (this.type !== 'boss' && this.type !== 'finalboss') {
-            this.x += this.vx;
-            if (Math.abs(this.x - this.startX) > this.patrolDistance) {
-                this.vx *= -1;
+        // Stagger effect for zombies
+        if (this.type === 'zombie') {
+            let dx = player.x - this.x;
+            let speed = 0.8;
+            if (Math.abs(dx) > 30) {
+                this.vx = dx > 0 ? speed : -speed;
+                this.x += Math.sin(this.animFrame * 0.05) * 0.5 + this.vx;
+            }
+            if (this.checkCollision(player) && !player.invincible) {
+                player.takeDamage(12);
             }
         }
         
-        // Boss behavior (both boss and finalboss types)
-        if (this.type === 'boss' || this.type === 'finalboss') {
+        // Shooter behavior
+        else if (this.type === 'shooter') {
+            this.shootCooldown--;
+            if (this.shootCooldown <= 0) {
+                this.shootCooldown = 90;
+                let dx = player.x - this.x;
+                let dy = (player.y + 20) - (this.y + 20);
+                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                if (projectiles.length < MAX_PROJECTILES) {
+                    projectiles.push(new Projectile(
+                        this.x + 16, this.y + 20,
+                        (dx / dist) * 3, (dy / dist) * 3,
+                        true, 15
+                    ));
+                }
+            }
+        }
+        
+        // Boss and Mutant boss behavior
+        else if (this.type === 'boss' || this.type === 'finalboss') {
             if (this.attackCooldown > 0) this.attackCooldown--;
             if (this.groundPoundCooldown > 0) this.groundPoundCooldown--;
             
             let dx = player.x - this.x;
             let isFinal = this.type === 'finalboss';
-            let speed = isFinal ? 1.5 : 2.0;
+            let isAngry = this.health < this.maxHealth * 0.5;
+            let speed = isFinal ? (isAngry ? 2.5 : 1.8) : 2.0;
             let meleeRange = isFinal ? 70 : 60;
-            let meleeDamage = isFinal ? 25 : 25;
-            let meleeCooldown = isFinal ? 90 : 60;
+            let meleeDamage = isFinal ? 30 : 25;
+            let meleeCooldown = isFinal ? 70 : 60;
             
-            // Ground pound attack
-            if (this.groundPoundCooldown === 0 && this.grounded && !this.groundPounding) {
+            // Mutant boss: charge attack
+            if (isFinal) {
+                if (this.chargeCooldown > 0) this.chargeCooldown--;
+                if (this.charging) {
+                    this.chargeTimer--;
+                    let chargeDir = this.chargeDir || 1;
+                    this.x += chargeDir * (isAngry ? 8 : 6);
+                    if (this.chargeTimer <= 0) this.charging = false;
+                    // Charge hit
+                    if (this.checkCollision(player)) {
+                        player.takeDamage(isAngry ? 35 : 25);
+                        this.charging = false;
+                    }
+                } else if (this.chargeCooldown === 0 && Math.abs(dx) > 100 && Math.abs(dx) < 300 && this.grounded) {
+                    this.charging = true;
+                    this.chargeTimer = 30;
+                    this.chargeDir = dx > 0 ? 1 : -1;
+                    this.chargeCooldown = isAngry ? 120 : 180;
+                }
+                
+                // Mutant boss: poison spit
+                if (!this.charging && this.attackCooldown === 0 && Math.abs(dx) > 80 && Math.random() < 0.02) {
+                    if (projectiles.length < MAX_PROJECTILES) {
+                        projectiles.push(new Projectile(
+                            this.x + (dx > 0 ? this.width : 0), this.y + 20,
+                            (dx > 0 ? 3 : -3), -1.5, true, 18
+                        ));
+                        this.attackCooldown = 50;
+                    }
+                }
+            }
+            
+            // Ground pound
+            if (this.groundPoundCooldown === 0 && this.grounded && !this.groundPounding && !this.charging) {
                 if (Math.abs(dx) < 200) {
                     this.vy = -10;
                     this.groundPounding = true;
                 }
             }
-            
-            // When landing during ground pound
             if (this.groundPounding && this.grounded) {
                 this.groundPounding = false;
-                this.groundPoundCooldown = isFinal ? 240 : 180;
-                // Shockwave damage
+                this.groundPoundCooldown = isFinal ? (isAngry ? 150 : 200) : 180;
                 if (Math.abs(dx) < 120 && Math.abs(player.y - (this.y + this.height)) < 10) {
-                    player.takeDamage(20);
+                    player.takeDamage(isAngry ? 25 : 20);
                 }
             }
             
-            // Move toward player slowly
-            if (Math.abs(dx) > meleeRange && !this.groundPounding) {
+            // Move toward player
+            if (!this.charging && Math.abs(dx) > meleeRange && !this.groundPounding) {
                 this.vx = dx > 0 ? speed : -speed;
                 this.x += this.vx;
             }
             
             // Melee attack
-            if (Math.abs(dx) < meleeRange && this.attackCooldown === 0 && !this.groundPounding) {
+            if (!this.charging && Math.abs(dx) < meleeRange && this.attackCooldown === 0 && !this.groundPounding) {
                 if (Math.abs(player.y - this.y) < 50) {
                     player.takeDamage(meleeDamage);
                     this.attackCooldown = meleeCooldown;
                 }
             }
-        } else {
-            // Regular enemy collision with player
+        }
+        
+        // Basic enemy patrol
+        else if (this.type === 'basic') {
+            this.x += this.vx;
+            if (Math.abs(this.x - this.startX) > this.patrolDistance) this.vx *= -1;
             if (this.checkCollision(player) && !player.invincible) {
                 player.takeDamage(15);
             }
         }
         
         // Apply gravity
-        this.vy += GRAVITY * 0.5;
+        this.vy += GRAVITY * (this.type === 'boss' || this.type === 'finalboss' ? 1.0 : 0.5);
         this.y += this.vy;
         
         // Ground collision
@@ -561,94 +858,182 @@ class Enemy {
     }
     
     takeDamage(amount) {
+        if (this.dead) return;
         this.health -= amount;
-        // Knockback
         this.vx = player.facingRight ? 3 : -3;
         this.vy = -3;
+        SoundFX.enemyDeath();
         
         if (this.health <= 0) {
             this.dead = true;
-            // Drop noodle
-            currentLevelData.noodles.push({
-                x: this.x + 8,
-                y: this.y,
-                width: 16,
-                height: 16
-            });
+            this.charging = false;
+            currentLevelData.noodles.push({ x: this.x + 8, y: this.y, width: 16, height: 16 });
+            // Zombie resurrection timer
+            if (this.type === 'zombie') {
+                this.resurrectionTimer = 180;
+            }
         }
     }
     
     draw() {
-        if (this.dead) return;
+        if (this.dead) {
+            // Draw resurrection glow for zombies
+            if (this.type === 'zombie' && this.resurrectionTimer > 0) {
+                ctx.save();
+                ctx.fillStyle = `rgba(100, 255, 100, ${0.1 + Math.sin(this.resurrectionTimer * 0.1) * 0.1})`;
+                ctx.fillRect(this.x - 4, this.y - 4, this.width + 8, this.height + 8);
+                ctx.restore();
+            }
+            return;
+        }
         
         ctx.save();
         
+        // Stun visual
+        if (this.stunned) {
+            ctx.globalAlpha = 0.5 + Math.sin(this.animFrame * 0.3) * 0.3;
+        }
+        
         if (this.type === 'finalboss') {
-            // Final boss - biggest, throne room
-            let angryFinal = this.health < this.maxHealth * 0.5;
-            ctx.fillStyle = angryFinal ? '#8a0000' : '#4a0000';
+            // MUTANT BOSS - mutated crocodile abomination
+            let angry = this.health < this.maxHealth * 0.5;
+            let baseColor = angry ? '#2a0a00' : '#1a3a0a';
+            let veinColor = angry ? '#FF00FF' : '#7B00AA';
+            let eyeColor = angry ? '#FF00FF' : '#FF0000';
+            
+            // Body
+            ctx.fillStyle = baseColor;
             ctx.fillRect(this.x, this.y, 56, 64);
             
-            // Crown
-            ctx.fillStyle = '#FFD700';
-            ctx.fillRect(this.x + 12, this.y - 10, 32, 10);
-            ctx.fillRect(this.x + 8, this.y - 6, 40, 6);
-            ctx.fillRect(this.x + 16, this.y - 14, 8, 8);
-            ctx.fillRect(this.x + 32, this.y - 14, 8, 8);
+            // Mutated bulges
+            ctx.fillStyle = angry ? '#3a1a1a' : '#2a4a1a';
+            ctx.fillRect(this.x - 6, this.y + 8, 10, 16);
+            ctx.fillRect(this.x + 52, this.y + 12, 10, 16);
+            ctx.fillRect(this.x + 10, this.y - 6, 36, 8);
             
-            // Eyes (glow red, larger)
-            ctx.fillStyle = angryFinal ? '#FF6600' : '#FF0000';
-            ctx.fillRect(this.x + 8, this.y + 10, 16, 16);
-            ctx.fillRect(this.x + 32, this.y + 10, 16, 16);
+            // Glowing veins (phase 2)
+            if (angry) {
+                for (let i = 0; i < 4; i++) {
+                    ctx.fillStyle = `rgba(255, 0, 255, ${0.3 + Math.sin(this.animFrame * 0.1 + i) * 0.2})`;
+                    ctx.fillRect(this.x + 8 + i * 12, this.y + 20 + Math.sin(this.animFrame * 0.05 + i) * 4, 4, 20);
+                }
+            }
             
-            // Horns
+            // Extra eyes (mutant feature)
+            ctx.fillStyle = '#FFF';
+            ctx.fillRect(this.x + 4, this.y + 6, 8, 8);
+            ctx.fillRect(this.x + 44, this.y + 6, 8, 8);
+            if (angry) {
+                ctx.fillRect(this.x + 24, this.y + 2, 8, 8);
+                ctx.fillRect(this.x + 16, this.y + 16, 6, 6);
+                ctx.fillRect(this.x + 34, this.y + 16, 6, 6);
+            }
+            ctx.fillStyle = eyeColor;
+            ctx.fillRect(this.x + 6, this.y + 8, 4, 4);
+            ctx.fillRect(this.x + 46, this.y + 8, 4, 4);
+            if (angry) {
+                ctx.fillRect(this.x + 26, this.y + 4, 4, 4);
+                ctx.fillRect(this.x + 18, this.y + 18, 3, 3);
+                ctx.fillRect(this.x + 36, this.y + 18, 3, 3);
+            }
+            
+            // Slime trail
+            ctx.fillStyle = 'rgba(0, 255, 0, 0.2)';
+            ctx.fillRect(this.x - 4, this.y + 58, 64, 10);
+            ctx.fillRect(this.x - 8, this.y + 62, 72, 6);
+            
+            // Claws
             ctx.fillStyle = '#222';
-            ctx.fillRect(this.x - 6, this.y - 12, 14, 20);
-            ctx.fillRect(this.x + 48, this.y - 12, 14, 20);
-            
-            // Spikes on shoulders
-            ctx.fillStyle = '#333';
-            ctx.fillRect(this.x - 8, this.y + 20, 8, 12);
-            ctx.fillRect(this.x + 56, this.y + 20, 8, 12);
-            
-            // Health bar
-            ctx.fillStyle = '#000';
-            ctx.fillRect(this.x, this.y - 24, 56, 8);
-            ctx.fillStyle = angryFinal ? '#FF6600' : '#FF0000';
-            ctx.fillRect(this.x + 2, this.y - 22, (this.health / this.maxHealth) * 52, 4);
+            ctx.fillRect(this.x - 4, this.y + 44, 6, 12);
+            ctx.fillRect(this.x + 54, this.y + 44, 6, 12);
+            ctx.fillStyle = '#555';
+            ctx.fillRect(this.x - 6, this.y + 52, 4, 6);
+            ctx.fillRect(this.x + 58, this.y + 52, 4, 6);
             
         } else if (this.type === 'boss') {
-            // Boss - bigger, in temple
             let angry = this.health < this.maxHealth * 0.5;
             ctx.fillStyle = angry ? '#6a00a0' : '#4a0080';
             ctx.fillRect(this.x, this.y, 48, 56);
-            
-            // Eyes (glow red)
             ctx.fillStyle = angry ? '#FF6600' : '#FF0000';
             ctx.fillRect(this.x + 8, this.y + 8, 12, 12);
             ctx.fillRect(this.x + 28, this.y + 8, 12, 12);
-            
-            // Horns
             ctx.fillStyle = '#222';
             ctx.fillRect(this.x - 4, this.y - 8, 12, 16);
             ctx.fillRect(this.x + 40, this.y - 8, 12, 16);
-            
-            // Health bar
             ctx.fillStyle = '#000';
             ctx.fillRect(this.x, this.y - 16, 48, 8);
             ctx.fillStyle = '#FF0000';
             ctx.fillRect(this.x + 2, this.y - 14, (this.health / this.maxHealth) * 44, 4);
+            
+        } else if (this.type === 'zombie') {
+            // ZOMBIE - decaying green corps
+            ctx.fillStyle = '#3a5a2a';
+            ctx.fillRect(this.x + 2, this.y + 4, 28, 32);
+            ctx.fillStyle = '#2a4a1a';
+            ctx.fillRect(this.x + 4, this.y + 8, 24, 8);
+            
+            // Stitches
+            ctx.fillStyle = '#222';
+            ctx.fillRect(this.x + 6, this.y + 16, 3, 3);
+            ctx.fillRect(this.x + 14, this.y + 8, 3, 3);
+            ctx.fillRect(this.x + 22, this.y + 20, 3, 3);
+            
+            // Head
+            ctx.fillStyle = '#4a6a3a';
+            ctx.fillRect(this.x + 4, this.y, 24, 16);
+            
+            // Hollow eyes
+            ctx.fillStyle = '#000';
+            ctx.fillRect(this.x + 8, this.y + 4, 6, 6);
+            ctx.fillRect(this.x + 18, this.y + 4, 6, 6);
+            ctx.fillStyle = '#FFF';
+            ctx.fillRect(this.x + 9, this.y + 5, 2, 2);
+            ctx.fillRect(this.x + 19, this.y + 5, 2, 2);
+            
+            // Arms outstretched
+            let armWave = Math.sin(this.animFrame * 0.08) * 3;
+            ctx.fillStyle = '#3a5a2a';
+            ctx.fillRect(this.x - 4, this.y + 12 + armWave, 6, 8);
+            ctx.fillRect(this.x + 30, this.y + 12 - armWave, 6, 8);
+            
+            // Shambling legs
+            let legOff = Math.sin(this.animFrame * 0.1) * 5;
+            ctx.fillRect(this.x + 6, this.y + 32 + legOff, 8, 12 - legOff);
+            ctx.fillRect(this.x + 18, this.y + 32 - legOff, 8, 12 + legOff);
+            
+        } else if (this.type === 'shooter') {
+            // SHOOTER - dark purple hooded figure
+            ctx.fillStyle = '#3a1a4a';
+            ctx.fillRect(this.x + 4, this.y + 8, 24, 24);
+            ctx.fillStyle = '#2a0a3a';
+            ctx.fillRect(this.x + 4, this.y + 8, 24, 6);
+            
+            // Head
+            ctx.fillStyle = '#4a2a5a';
+            ctx.fillRect(this.x + 6, this.y, 20, 16);
+            
+            // Glowing eyes
+            ctx.fillStyle = '#AA44FF';
+            ctx.fillRect(this.x + 10, this.y + 4, 4, 4);
+            ctx.fillRect(this.x + 18, this.y + 4, 4, 4);
+            
+            // Arms (throwing)
+            let throwAnim = Math.sin(this.animFrame * 0.15) * 4;
+            ctx.fillStyle = '#3a1a4a';
+            ctx.fillRect(this.x + 28, this.y + 8 + throwAnim, 8, 6);
+            ctx.fillRect(this.x - 4, this.y + 8 - throwAnim, 8, 6);
+            
+            // Legs
+            ctx.fillRect(this.x + 8, this.y + 32, 6, 8);
+            ctx.fillRect(this.x + 18, this.y + 32, 6, 8);
+            
         } else {
-            // Regular enemy
+            // Basic enemy
             ctx.fillStyle = '#8B0000';
             ctx.fillRect(this.x + 4, this.y + 8, 24, 24);
-            
-            // Eyes
             ctx.fillStyle = '#FFFF00';
             ctx.fillRect(this.x + 8, this.y + 12, 6, 6);
             ctx.fillRect(this.x + 18, this.y + 12, 6, 6);
-            
-            // Legs
             let legOffset = Math.sin(this.animFrame * 0.2) * 4;
             ctx.fillRect(this.x + 6, this.y + 32 + legOffset, 8, 8 - legOffset);
             ctx.fillRect(this.x + 18, this.y + 32 - legOffset, 8, 8 + legOffset);
@@ -662,37 +1047,35 @@ class Enemy {
 // LEVEL DATA
 // ============================================
 const LEVELS = [
-    // Level 1: Tutorial - simple platforms, one enemy - CLEAR PATH
+    // Level 1: Tutorial
     {
         platforms: [
             { x: 0, y: 550, width: 800, height: 50 },
             { x: 200, y: 480, width: 150, height: 20 },
             { x: 450, y: 420, width: 150, height: 20 },
-            { x: 650, y: 500, width: 150, height: 50 },  // Raised platform for exit
+            { x: 650, y: 500, width: 150, height: 50 },
         ],
-        enemies: [
-            { x: 500, y: 380, type: 'basic' }
-        ],
+        enemies: [{ x: 500, y: 380, type: 'basic' }],
         noodles: [
             { x: 260, y: 440, width: 16, height: 16 },
             { x: 510, y: 380, width: 16, height: 16 },
             { x: 700, y: 460, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
-        exit: { x: 720, y: 450, width: 40, height: 50 }  // On the raised platform
+        powerups: [{ x: 350, y: 385, type: 'steak' }],
+        startX: 50, startY: 480,
+        exit: { x: 720, y: 450, width: 40, height: 50 }
     },
-    // Level 2: Staircase challenge - properly spaced for jumps
+    // Level 2: Staircase challenge
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Ground
-            { x: 200, y: 480, width: 120, height: 20 },    // Step 1: easy hop
-            { x: 380, y: 420, width: 120, height: 20 },    // Step 2: reachable jump (gap ~60px)
-            { x: 550, y: 360, width: 120, height: 20 },    // Step 3: reachable jump
-            { x: 380, y: 300, width: 120, height: 20 },    // Step 4: go back across
-            { x: 200, y: 240, width: 120, height: 20 },    // Step 5: reachable jump
-            { x: 50, y: 180, width: 150, height: 20 },     // Step 6: reachable jump
-            { x: 600, y: 300, width: 150, height: 20 },    // Side path to exit
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 200, y: 480, width: 120, height: 20 },
+            { x: 380, y: 420, width: 120, height: 20 },
+            { x: 550, y: 360, width: 120, height: 20 },
+            { x: 380, y: 300, width: 120, height: 20 },
+            { x: 200, y: 240, width: 120, height: 20 },
+            { x: 50, y: 180, width: 150, height: 20 },
+            { x: 600, y: 300, width: 150, height: 20 },
         ],
         enemies: [
             { x: 420, y: 380, type: 'basic' },
@@ -707,20 +1090,19 @@ const LEVELS = [
             { x: 100, y: 140, width: 16, height: 16 },
             { x: 660, y: 260, width: 16, height: 16 },
         ],
-        startX: 30,
-        startY: 480,
+        startX: 30, startY: 480,
         exit: { x: 650, y: 250, width: 40, height: 50 }
     },
-    // Level 3: Tower climb - properly spaced platforms
+    // Level 3: Tower climb
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Ground
-            { x: 150, y: 480, width: 120, height: 20 },    // Step 1
-            { x: 320, y: 420, width: 120, height: 20 },    // Step 2: gap ~50px
-            { x: 490, y: 360, width: 120, height: 20 },    // Step 3: gap ~50px
-            { x: 320, y: 300, width: 120, height: 20 },    // Step 4: cross back
-            { x: 150, y: 240, width: 120, height: 20 },    // Step 5: gap ~50px
-            { x: 320, y: 180, width: 160, height: 20 },    // Step 6: exit platform
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 150, y: 480, width: 120, height: 20 },
+            { x: 320, y: 420, width: 120, height: 20 },
+            { x: 490, y: 360, width: 120, height: 20 },
+            { x: 320, y: 300, width: 120, height: 20 },
+            { x: 150, y: 240, width: 120, height: 20 },
+            { x: 320, y: 180, width: 160, height: 20 },
         ],
         enemies: [
             { x: 350, y: 380, type: 'basic' },
@@ -735,23 +1117,22 @@ const LEVELS = [
             { x: 200, y: 200, width: 16, height: 16 },
             { x: 390, y: 140, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
+        startX: 50, startY: 480,
         exit: { x: 380, y: 130, width: 40, height: 50 }
     },
-    // Level 4: The Gauntlet - zigzag run with reachable jumps
+    // Level 4: The Gauntlet
     {
         platforms: [
-            { x: 0, y: 550, width: 200, height: 50 },      // Start ground
-            { x: 250, y: 500, width: 100, height: 20 },    // Step 1: gap ~50px
-            { x: 400, y: 450, width: 100, height: 20 },    // Step 2: gap ~50px
-            { x: 550, y: 400, width: 120, height: 20 },    // Step 3: gap ~50px
-            { x: 400, y: 350, width: 100, height: 20 },    // Step 4: turn back
-            { x: 220, y: 300, width: 100, height: 20 },    // Step 5: gap ~80px
-            { x: 80, y: 250, width: 100, height: 20 },     // Step 6: gap ~40px
-            { x: 250, y: 200, width: 100, height: 20 },    // Step 7: gap ~70px
-            { x: 420, y: 200, width: 100, height: 20 },    // Step 8: easy hop
-            { x: 600, y: 200, width: 150, height: 20 },    // Exit platform
+            { x: 0, y: 550, width: 200, height: 50 },
+            { x: 250, y: 500, width: 100, height: 20 },
+            { x: 400, y: 450, width: 100, height: 20 },
+            { x: 550, y: 400, width: 120, height: 20 },
+            { x: 400, y: 350, width: 100, height: 20 },
+            { x: 220, y: 300, width: 100, height: 20 },
+            { x: 80, y: 250, width: 100, height: 20 },
+            { x: 250, y: 200, width: 100, height: 20 },
+            { x: 420, y: 200, width: 100, height: 20 },
+            { x: 600, y: 200, width: 150, height: 20 },
         ],
         enemies: [
             { x: 270, y: 460, type: 'basic' },
@@ -767,23 +1148,20 @@ const LEVELS = [
             { x: 120, y: 210, width: 16, height: 16 },
             { x: 660, y: 160, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
+        startX: 50, startY: 480,
         exit: { x: 650, y: 150, width: 40, height: 50 }
     },
-    // Level 5: Boss Temple - fight arena with reachable platforms
+    // Level 5: Boss Temple
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Main floor
-            { x: 80, y: 460, width: 140, height: 20 },     // Left platform 1
-            { x: 580, y: 460, width: 140, height: 20 },    // Right platform 1
-            { x: 200, y: 380, width: 100, height: 20 },    // Left platform 2
-            { x: 500, y: 380, width: 100, height: 20 },    // Right platform 2
-            { x: 350, y: 320, width: 100, height: 20 },    // Middle boss platform
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 80, y: 460, width: 140, height: 20 },
+            { x: 580, y: 460, width: 140, height: 20 },
+            { x: 200, y: 380, width: 100, height: 20 },
+            { x: 500, y: 380, width: 100, height: 20 },
+            { x: 350, y: 320, width: 100, height: 20 },
         ],
-        enemies: [
-            { x: 370, y: 280, type: 'boss' }
-        ],
+        enemies: [{ x: 370, y: 280, type: 'boss' }],
         noodles: [
             { x: 140, y: 420, width: 16, height: 16 },
             { x: 640, y: 420, width: 16, height: 16 },
@@ -791,27 +1169,28 @@ const LEVELS = [
             { x: 540, y: 340, width: 16, height: 16 },
             { x: 390, y: 280, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
-        exit: null // Exit appears after boss defeated
+        powerups: [{ x: 350, y: 280, type: 'steak' }],
+        startX: 50, startY: 480,
+        exit: null
     },
-    // Level 6: The Escape - crumbling temple run
+    // Level 6: The Escape
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Ground
-            { x: 100, y: 480, width: 100, height: 20 },    // Step 1
-            { x: 280, y: 420, width: 100, height: 20 },    // Step 2
-            { x: 460, y: 370, width: 100, height: 20 },    // Step 3
-            { x: 280, y: 320, width: 100, height: 20 },    // Step 4 (go back)
-            { x: 100, y: 270, width: 100, height: 20 },    // Step 5
-            { x: 300, y: 220, width: 120, height: 20 },    // Step 6
-            { x: 550, y: 220, width: 120, height: 20 },    // Step 7
-            { x: 680, y: 170, width: 120, height: 20 },    // Exit platform
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 100, y: 480, width: 100, height: 20 },
+            { x: 280, y: 420, width: 100, height: 20 },
+            { x: 460, y: 370, width: 100, height: 20 },
+            { x: 280, y: 320, width: 100, height: 20 },
+            { x: 100, y: 270, width: 100, height: 20 },
+            { x: 300, y: 220, width: 120, height: 20 },
+            { x: 550, y: 220, width: 120, height: 20 },
+            { x: 680, y: 170, width: 120, height: 20 },
         ],
         enemies: [
             { x: 310, y: 380, type: 'basic' },
             { x: 130, y: 230, type: 'basic' },
-            { x: 580, y: 180, type: 'basic' }
+            { x: 580, y: 180, type: 'basic' },
+            { x: 200, y: 400, type: 'basic' }
         ],
         noodles: [
             { x: 150, y: 440, width: 16, height: 16 },
@@ -821,23 +1200,22 @@ const LEVELS = [
             { x: 150, y: 230, width: 16, height: 16 },
             { x: 720, y: 130, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
+        startX: 50, startY: 480,
         exit: { x: 730, y: 120, width: 40, height: 50 }
     },
-    // Level 7: Shadow Swarm - lots of enemies
+    // Level 7: Shadow Swarm
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Ground
-            { x: 80, y: 480, width: 120, height: 20 },     // Step 1
-            { x: 260, y: 440, width: 100, height: 20 },    // Step 2
-            { x: 440, y: 400, width: 100, height: 20 },    // Step 3
-            { x: 600, y: 360, width: 120, height: 20 },    // Step 4
-            { x: 440, y: 320, width: 100, height: 20 },    // Step 5 (go back)
-            { x: 260, y: 280, width: 100, height: 20 },    // Step 6
-            { x: 80, y: 240, width: 100, height: 20 },     // Step 7
-            { x: 250, y: 200, width: 120, height: 20 },    // Step 8
-            { x: 500, y: 200, width: 150, height: 20 },    // Exit platform
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 80, y: 480, width: 120, height: 20 },
+            { x: 260, y: 440, width: 100, height: 20 },
+            { x: 440, y: 400, width: 100, height: 20 },
+            { x: 600, y: 360, width: 120, height: 20 },
+            { x: 440, y: 320, width: 100, height: 20 },
+            { x: 260, y: 280, width: 100, height: 20 },
+            { x: 80, y: 240, width: 100, height: 20 },
+            { x: 250, y: 200, width: 120, height: 20 },
+            { x: 500, y: 200, width: 150, height: 20 },
         ],
         enemies: [
             { x: 300, y: 400, type: 'basic' },
@@ -855,23 +1233,20 @@ const LEVELS = [
             { x: 130, y: 200, width: 16, height: 16 },
             { x: 580, y: 160, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
+        startX: 50, startY: 480,
         exit: { x: 600, y: 150, width: 40, height: 50 }
     },
-    // Level 8: Final Boss - the ultimate challenge
+    // Level 8: Mutant's Awakening - the first mutant boss
     {
         platforms: [
-            { x: 0, y: 550, width: 800, height: 50 },      // Main floor
-            { x: 60, y: 460, width: 140, height: 20 },     // Left platform 1
-            { x: 600, y: 460, width: 140, height: 20 },    // Right platform 1
-            { x: 180, y: 380, width: 120, height: 20 },    // Left platform 2
-            { x: 500, y: 380, width: 120, height: 20 },    // Right platform 2
-            { x: 320, y: 300, width: 160, height: 20 },    // Middle platform
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 60, y: 460, width: 140, height: 20 },
+            { x: 600, y: 460, width: 140, height: 20 },
+            { x: 180, y: 380, width: 120, height: 20 },
+            { x: 500, y: 380, width: 120, height: 20 },
+            { x: 320, y: 300, width: 160, height: 20 },
         ],
-        enemies: [
-            { x: 350, y: 260, type: 'finalboss' }
-        ],
+        enemies: [{ x: 350, y: 260, type: 'finalboss' }],
         noodles: [
             { x: 110, y: 420, width: 16, height: 16 },
             { x: 660, y: 420, width: 16, height: 16 },
@@ -879,9 +1254,148 @@ const LEVELS = [
             { x: 560, y: 340, width: 16, height: 16 },
             { x: 380, y: 260, width: 16, height: 16 },
         ],
-        startX: 50,
-        startY: 480,
-        exit: null // Defeat the final boss to win!
+        powerups: [
+            { x: 110, y: 425, type: 'steak' },
+            { x: 660, y: 425, type: 'speed' }
+        ],
+        hazards: [{ x: 0, y: 535, width: 800, height: 15 }], // toxic floor edge
+        startX: 50, startY: 480,
+        exit: null
+    },
+    // Level 9: Toxic Sewer - swimming and zombies
+    {
+        platforms: [
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 0, y: 480, width: 120, height: 20 },
+            { x: 200, y: 500, width: 100, height: 20 },
+            { x: 380, y: 510, width: 40, height: 20 },
+            { x: 500, y: 480, width: 120, height: 20 },
+            { x: 700, y: 470, width: 100, height: 20 },
+            { x: 300, y: 430, width: 80, height: 20 },
+            { x: 550, y: 400, width: 100, height: 20 },
+            { x: 100, y: 380, width: 80, height: 20 },
+            { x: 400, y: 350, width: 100, height: 20 },
+            { x: 650, y: 350, width: 120, height: 20 },
+        ],
+        enemies: [
+            { x: 220, y: 460, type: 'zombie' },
+            { x: 540, y: 440, type: 'zombie' },
+            { x: 140, y: 340, type: 'zombie' },
+            { x: 450, y: 310, type: 'zombie' },
+            { x: 700, y: 310, type: 'basic' }
+        ],
+        noodles: [
+            { x: 60, y: 440, width: 16, height: 16 },
+            { x: 250, y: 460, width: 16, height: 16 },
+            { x: 420, y: 470, width: 16, height: 16 },
+            { x: 550, y: 440, width: 16, height: 16 },
+            { x: 350, y: 390, width: 16, height: 16 },
+            { x: 600, y: 360, width: 16, height: 16 },
+            { x: 150, y: 340, width: 16, height: 16 },
+            { x: 710, y: 310, width: 16, height: 16 },
+        ],
+        water: [
+            { x: 0, y: 520, width: 800, height: 35 },
+            { x: 160, y: 410, width: 100, height: 30 },
+            { x: 450, y: 440, width: 40, height: 30 },
+            { x: 680, y: 400, width: 120, height: 30 },
+        ],
+        powerups: [
+            { x: 200, y: 500, type: 'steak' },
+            { x: 460, y: 350, type: 'shuriken' }
+        ],
+        startX: 30, startY: 480,
+        exit: { x: 700, y: 300, width: 40, height: 50 }
+    },
+    // Level 10: The Hive - gauntlet with moving platforms and shooters
+    {
+        platforms: [
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 50, y: 480, width: 100, height: 20 },
+            { x: 200, y: 430, width: 100, height: 20 },
+            { x: 380, y: 450, width: 80, height: 20, moveType: 'horizontal', moveRange: 80, moveSpeed: 1.5 },
+            { x: 520, y: 420, width: 100, height: 20 },
+            { x: 300, y: 370, width: 80, height: 20 },
+            { x: 100, y: 340, width: 80, height: 20, moveType: 'horizontal', moveRange: 60, moveSpeed: 1 },
+            { x: 500, y: 320, width: 100, height: 20 },
+            { x: 650, y: 360, width: 80, height: 20 },
+            { x: 200, y: 280, width: 80, height: 20 },
+            { x: 400, y: 250, width: 100, height: 20 },
+            { x: 600, y: 250, width: 120, height: 20 },
+        ],
+        enemies: [
+            { x: 240, y: 390, type: 'zombie' },
+            { x: 580, y: 380, type: 'shooter' },
+            { x: 140, y: 300, type: 'zombie' },
+            { x: 550, y: 280, type: 'shooter' },
+            { x: 650, y: 320, type: 'basic' },
+            { x: 250, y: 240, type: 'basic' }
+        ],
+        noodles: [
+            { x: 100, y: 440, width: 16, height: 16 },
+            { x: 420, y: 410, width: 16, height: 16 },
+            { x: 570, y: 380, width: 16, height: 16 },
+            { x: 350, y: 330, width: 16, height: 16 },
+            { x: 140, y: 300, width: 16, height: 16 },
+            { x: 550, y: 280, width: 16, height: 16 },
+            { x: 450, y: 210, width: 16, height: 16 },
+            { x: 660, y: 210, width: 16, height: 16 },
+        ],
+        water: [
+            { x: 300, y: 530, width: 200, height: 22 },
+        ],
+        hazards: [
+            { x: 200, y: 530, width: 100, height: 20 },
+            { x: 500, y: 530, width: 100, height: 20 },
+        ],
+        powerups: [
+            { x: 380, y: 415, type: 'steak' },
+            { x: 500, y: 280, type: 'damage' },
+            { x: 660, y: 210, type: 'star' },
+        ],
+        startX: 30, startY: 480,
+        exit: { x: 650, y: 200, width: 40, height: 50 }
+    },
+    // Level 11: Mutant's Lair - final mutant boss
+    {
+        platforms: [
+            { x: 0, y: 550, width: 800, height: 50 },
+            { x: 60, y: 470, width: 130, height: 20 },
+            { x: 610, y: 470, width: 130, height: 20 },
+            { x: 180, y: 390, width: 100, height: 20 },
+            { x: 520, y: 390, width: 100, height: 20 },
+            { x: 320, y: 320, width: 160, height: 20 },
+            { x: 80, y: 320, width: 80, height: 20 },
+            { x: 640, y: 320, width: 80, height: 20 },
+        ],
+        enemies: [
+            { x: 350, y: 280, type: 'finalboss' },
+            { x: 200, y: 350, type: 'zombie' },
+            { x: 550, y: 350, type: 'zombie' },
+        ],
+        noodles: [
+            { x: 110, y: 430, width: 16, height: 16 },
+            { x: 640, y: 430, width: 16, height: 16 },
+            { x: 220, y: 350, width: 16, height: 16 },
+            { x: 560, y: 350, width: 16, height: 16 },
+            { x: 380, y: 280, width: 16, height: 16 },
+            { x: 120, y: 280, width: 16, height: 16 },
+            { x: 680, y: 280, width: 16, height: 16 },
+        ],
+        water: [
+            { x: 0, y: 530, width: 800, height: 22 },
+        ],
+        hazards: [
+            { x: 0, y: 525, width: 800, height: 25 },
+        ],
+        powerups: [
+            { x: 110, y: 435, type: 'steak' },
+            { x: 640, y: 435, type: 'steak' },
+            { x: 380, y: 285, type: 'damage' },
+            { x: 380, y: 285, type: 'star' },
+        ],
+        startX: 50, startY: 480,
+        exit: null
     }
 ];
 
@@ -895,20 +1409,32 @@ function initLevel(levelIndex) {
     currentLevel = levelIndex;
     const level = LEVELS[levelIndex];
     
-    // Save noodles before resetting
     if (player) {
         totalNoodles += player.noodles;
     }
     
+    // Deep copy platforms with moving platform state
+    let platforms = level.platforms.map(p => ({
+        ...p,
+        origX: p.x,
+        origY: p.y,
+        vx: 0,
+        moveTimer: Math.random() * 100
+    }));
+    
     currentLevelData = {
-        platforms: [...level.platforms],
+        platforms: platforms,
         enemies: level.enemies.map(e => new Enemy(e.x, e.y, e.type)),
-        noodles: [...level.noodles],
+        noodles: level.noodles ? [...level.noodles] : [],
+        water: level.water ? level.water.map(w => ({...w})) : [],
+        hazards: level.hazards ? level.hazards.map(h => ({...h})) : [],
+        powerups: level.powerups ? level.powerups.map(p => ({...p})) : [],
         startX: level.startX,
         startY: level.startY,
         exit: level.exit
     };
     
+    projectiles = [];
     player = new Player(level.startX, level.startY, selectedCharacter);
     player.noodles = totalNoodles;
 }
@@ -1061,7 +1587,6 @@ function drawCharacterSelect() {
 }
 
 function drawHUD() {
-    // Health bar
     ctx.fillStyle = '#000';
     ctx.fillRect(10, 10, 204, 24);
     ctx.fillStyle = '#444';
@@ -1073,74 +1598,119 @@ function drawHUD() {
     ctx.textAlign = 'left';
     ctx.fillText(`HP: ${player.health}`, 16, 26);
     
-    // Lives
     drawPixelText(`Lives: ${player.lives}`, canvas.width - 100, 26, 16, '#FFF');
     
-    // Noodles
     ctx.fillStyle = '#FFD700';
     ctx.fillRect(canvas.width / 2 - 50, 12, 16, 16);
     drawPixelText(`x ${player.noodles}`, canvas.width / 2 + 10, 26, 16, '#FFD700');
     
-    // Level
-    drawPixelText(`Level ${currentLevel + 1}/8`, canvas.width / 2, 55, 16, '#FFF');
+    drawPixelText(`Level ${currentLevel + 1}/11`, canvas.width / 2, 55, 16, '#FFF');
+    
+    // Ability indicator
+    ctx.fillStyle = player.abilityReady ? '#0F0' : '#666';
+    ctx.fillRect(10, canvas.height - 30, 14, 14);
+    ctx.fillStyle = '#FFF';
+    ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    let abilText = player.abilityReady ? 'ABILITY [SHIFT]' : `ABILITY ${Math.ceil(player.abilityCooldown / 60)}s`;
+    ctx.fillText(abilText, 28, canvas.height - 19);
+    
+    if (player.hasShuriken) {
+        ctx.fillStyle = player.shurikenCooldown > 0 ? '#666' : '#FFD700';
+        ctx.fillRect(10, canvas.height - 50, 14, 14);
+        ctx.fillStyle = '#FFF';
+        ctx.font = '10px monospace';
+        ctx.fillText(player.shurikenCooldown > 0 ? 'SHURIKEN...' : '[Z] SHURIKEN', 28, canvas.height - 39);
+    }
+    
+    let yOff = 70;
+    if (player.speedBoostTimer > 0) {
+        ctx.fillStyle = '#0FF';
+        ctx.fillRect(10, yOff, (player.speedBoostTimer / SPEED_BOOST_DURATION) * 80, 6);
+        ctx.fillStyle = '#FFF';
+        ctx.font = '10px monospace';
+        ctx.fillText('SPEED', 94, yOff + 6);
+        yOff += 8;
+    }
+    if (player.damageBoostTimer > 0) {
+        ctx.fillStyle = '#F00';
+        ctx.fillRect(10, yOff, (player.damageBoostTimer / DAMAGE_BOOST_DURATION) * 80, 6);
+        ctx.fillStyle = '#FFF';
+        ctx.font = '10px monospace';
+        ctx.fillText('DMG+', 94, yOff + 6);
+    }
 }
 
 function drawGame() {
-    // Clear with level-appropriate background
     let bgColor = '#87CEEB';
     if (currentLevel === 4 || currentLevel === 5) bgColor = '#2a1a3a';
     else if (currentLevel === 6) bgColor = '#1a2a1a';
     else if (currentLevel === 7) bgColor = '#2a1a1a';
+    else if (currentLevel === 8) bgColor = '#1a0a2a';
+    else if (currentLevel === 9) bgColor = '#1a2a1a';
+    else if (currentLevel === 10) bgColor = '#2a1a2a';
+    else if (currentLevel === 11) bgColor = '#0a0a0a';
     ctx.fillStyle = bgColor;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     
     // Level decorations
     if (currentLevel === 4) {
-        // Temple decorations for boss level
-        ctx.fillStyle = '#1a0a2a';
-        ctx.fillRect(0, 0, 50, canvas.height);
-        ctx.fillRect(canvas.width - 50, 0, 50, canvas.height);
+        ctx.fillStyle = '#1a0a2a'; ctx.fillRect(0, 0, 50, canvas.height); ctx.fillRect(canvas.width - 50, 0, 50, canvas.height);
         ctx.fillStyle = '#4a0080';
-        for (let i = 0; i < 5; i++) {
-            ctx.fillRect(60, 100 + i * 100, 20, 60);
-            ctx.fillRect(canvas.width - 80, 100 + i * 100, 20, 60);
-        }
+        for (let i = 0; i < 5; i++) { ctx.fillRect(60, 100 + i * 100, 20, 60); ctx.fillRect(canvas.width - 80, 100 + i * 100, 20, 60); }
     } else if (currentLevel === 5) {
-        // Crumbling temple - cracked pillars
-        ctx.fillStyle = '#1a0a2a';
-        ctx.fillRect(0, 0, 40, canvas.height);
-        ctx.fillRect(canvas.width - 40, 0, 40, canvas.height);
+        ctx.fillStyle = '#1a0a2a'; ctx.fillRect(0, 0, 40, canvas.height); ctx.fillRect(canvas.width - 40, 0, 40, canvas.height);
         ctx.fillStyle = '#4a3030';
         let sway = Math.sin(frameCount * 0.02) * 3;
-        for (let i = 0; i < 4; i++) {
-            ctx.fillRect(50 + sway, 120 + i * 130, 16, 50);
-            ctx.fillRect(canvas.width - 66 - sway, 120 + i * 130, 16, 50);
-        }
+        for (let i = 0; i < 4; i++) { ctx.fillRect(50 + sway, 120 + i * 130, 16, 50); ctx.fillRect(canvas.width - 66 - sway, 120 + i * 130, 16, 50); }
     } else if (currentLevel === 6) {
-        // Shadow forest - creepy trees
         ctx.fillStyle = '#0a1a0a';
-        for (let i = 0; i < 6; i++) {
-            let tx = 60 + i * 130;
-            let sway = Math.sin(frameCount * 0.01 + i) * 4;
-            ctx.fillRect(tx + sway, 100, 20, canvas.height - 100);
-            ctx.fillRect(tx - 10 + sway, 80, 40, 30);
-        }
+        for (let i = 0; i < 6; i++) { let tx = 60 + i * 130; let s = Math.sin(frameCount * 0.01 + i) * 4; ctx.fillRect(tx + s, 100, 20, canvas.height - 100); ctx.fillRect(tx - 10 + s, 80, 40, 30); }
     } else if (currentLevel === 7) {
-        // Final throne room - pillars of fire
+        // Level 8: Mutant's Awakening
+        ctx.fillStyle = '#1a0a2a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        for (let i = 0; i < 8; i++) {
+            let px = i * 100; let glow = Math.sin(frameCount * 0.03 + i) * 0.2 + 0.3;
+            ctx.fillStyle = `rgba(100, 0, 150, ${glow})`;
+            ctx.fillRect(px, 0, 10, canvas.height);
+        }
+    } else if (currentLevel === 8) {
+        // Level 9: Toxic Sewer
+        ctx.fillStyle = '#0a1a0a';
+        for (let i = 0; i < 4; i++) { ctx.fillRect(i * 220 + 20, 100, 30, canvas.height - 100); ctx.fillRect(i * 220 + 40, 120, 15, canvas.height - 120); }
+    } else if (currentLevel === 9) {
+        // Level 10: The Hive
+        ctx.fillStyle = '#1a0a1a';
+        for (let i = 0; i < 10; i++) {
+            let px = i * 85 + Math.sin(frameCount * 0.01 + i) * 5;
+            ctx.fillRect(px, canvas.height - 80, 20, 40 + Math.sin(frameCount * 0.02 + i) * 10);
+        }
+    } else if (currentLevel === 10) {
+        // Level 11: Mutant's Lair
         ctx.fillStyle = '#1a0a0a';
         for (let i = 0; i < 5; i++) {
             let px = 30 + i * 180;
             ctx.fillRect(px, 0, 15, canvas.height);
-            // Fire glow
             ctx.fillStyle = `rgba(255, 100, 0, ${0.3 + Math.sin(frameCount * 0.05 + i) * 0.15})`;
             ctx.fillRect(px - 5, 0, 25, canvas.height);
             ctx.fillStyle = '#1a0a0a';
         }
     } else {
-        // Clouds for regular levels
         ctx.fillStyle = '#FFF';
         ctx.fillRect(100 + Math.sin(frameCount * 0.01) * 20, 80, 80, 30);
         ctx.fillRect(500 + Math.sin(frameCount * 0.015) * 20, 120, 100, 40);
+    }
+    
+    // Water zones (drawn before platforms)
+    if (currentLevelData.water) {
+        for (let w of currentLevelData.water) {
+            ctx.fillStyle = 'rgba(0, 150, 200, 0.4)';
+            ctx.fillRect(w.x, w.y, w.width, w.height);
+            let waveOff = Math.sin(frameCount * 0.03) * 3;
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+            ctx.fillRect(w.x + waveOff, w.y + 2, w.width, 3);
+            ctx.fillRect(w.x - waveOff, w.y + 8, w.width, 2);
+        }
     }
     
     // Platforms
@@ -1150,6 +1720,7 @@ function drawGame() {
     else if (currentLevel === 5) { platformColor = '#3a2a3a'; grassColor = '#5a3a3a'; }
     else if (currentLevel === 6) { platformColor = '#2a3a2a'; grassColor = '#3a5a3a'; }
     else if (currentLevel === 7) { platformColor = '#3a2a2a'; grassColor = '#5a3a3a'; }
+    else if (currentLevel >= 8) { platformColor = '#2a2a3a'; grassColor = '#3a3a5a'; }
     
     ctx.fillStyle = platformColor;
     for (let platform of currentLevelData.platforms) {
@@ -1159,14 +1730,42 @@ function drawGame() {
         ctx.fillStyle = platformColor;
     }
     
+    // Hazards
+    if (currentLevelData.hazards) {
+        for (let h of currentLevelData.hazards) {
+            ctx.fillStyle = '#FF0000';
+            ctx.fillRect(h.x, h.y, h.width, h.height);
+            for (let i = 0; i < h.width; i += 12) {
+                ctx.fillStyle = '#8B0000';
+                ctx.beginPath();
+                ctx.moveTo(h.x + i, h.y + h.height);
+                ctx.lineTo(h.x + i + 6, h.y);
+                ctx.lineTo(h.x + i + 12, h.y + h.height);
+                ctx.fill();
+            }
+        }
+    }
+    
     // Exit door
     if (currentLevelData.exit) {
         ctx.fillStyle = '#FFD700';
-        ctx.fillRect(currentLevelData.exit.x, currentLevelData.exit.y, 
-                     currentLevelData.exit.width, currentLevelData.exit.height);
+        ctx.fillRect(currentLevelData.exit.x, currentLevelData.exit.y, currentLevelData.exit.width, currentLevelData.exit.height);
         ctx.fillStyle = '#FFA500';
-        ctx.fillRect(currentLevelData.exit.x + 5, currentLevelData.exit.y + 5, 
-                     currentLevelData.exit.width - 10, currentLevelData.exit.height - 10);
+        ctx.fillRect(currentLevelData.exit.x + 5, currentLevelData.exit.y + 5, currentLevelData.exit.width - 10, currentLevelData.exit.height - 10);
+    }
+    
+    // Power-ups
+    if (currentLevelData.powerups) {
+        for (let pu of currentLevelData.powerups) {
+            let bob = Math.sin(frameCount * 0.05 + pu.x) * 3;
+            ctx.fillStyle = pu.type === 'steak' ? '#8B4513' : pu.type === 'speed' ? '#00FFFF' : pu.type === 'damage' ? '#FF4444' : pu.type === 'star' ? '#FFFF00' : '#FFD700';
+            ctx.fillRect(pu.x, pu.y + bob, POWERUP_SIZE, POWERUP_SIZE);
+            ctx.fillStyle = '#FFF';
+            ctx.font = '14px monospace';
+            ctx.textAlign = 'center';
+            let label = pu.type === 'steak' ? 'S' : pu.type === 'speed' ? '>' : pu.type === 'damage' ? 'D' : pu.type === 'star' ? '*' : 'Z';
+            ctx.fillText(label, pu.x + POWERUP_SIZE/2, pu.y + bob + 15);
+        }
     }
     
     // Noodles
@@ -1177,13 +1776,32 @@ function drawGame() {
         ctx.fillRect(noodle.x + 2, noodle.y + 2, 12, 4);
     }
     
+    // Projectiles
+    for (let p of projectiles) p.draw();
+    
     // Enemies
-    for (let enemy of currentLevelData.enemies) {
-        enemy.draw();
-    }
+    for (let enemy of currentLevelData.enemies) enemy.draw();
     
     // Player
     player.draw();
+    
+    // Boss HP bar (big one at top)
+    let bossEnemy = currentLevelData.enemies.find(e => (e.type === 'boss' || e.type === 'finalboss') && !e.dead);
+    if (bossEnemy) {
+        let barW = 300;
+        let barX = (canvas.width - barW) / 2;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(barX - 10, 70, barW + 20, 28);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(barX, 74, barW, 18);
+        ctx.fillStyle = bossEnemy.health < bossEnemy.maxHealth * 0.5 ? '#FF6600' : '#FF0000';
+        ctx.fillRect(barX + 2, 76, (bossEnemy.health / bossEnemy.maxHealth) * (barW - 4), 14);
+        ctx.fillStyle = '#FFF';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'center';
+        let bossName = bossEnemy.type === 'finalboss' ? 'MUTANT BOSS' : 'BOSS';
+        ctx.fillText(`${bossName} ${bossEnemy.health}/${bossEnemy.maxHealth}`, canvas.width / 2, 87);
+    }
     
     // Attack effect
     if (player.attacking) {
@@ -1192,7 +1810,6 @@ function drawGame() {
         ctx.fillRect(ax, player.y, 40, player.height);
     }
     
-    // HUD
     drawHUD();
 }
 
@@ -1223,21 +1840,43 @@ function update() {
     frameCount++;
     
     if (gameState === 'PLAYING') {
+        // Update moving platforms
+        for (let platform of currentLevelData.platforms) {
+            if (platform.moveType === 'horizontal') {
+                platform.moveTimer += platform.moveSpeed || 1;
+                let offset = Math.sin(platform.moveTimer * 0.02) * (platform.moveRange || 80);
+                let prevX = platform.x;
+                platform.x = platform.origX + offset;
+                platform.vx = platform.x - prevX;
+            } else if (platform.moveType === 'vertical') {
+                platform.moveTimer += platform.moveSpeed || 1;
+                let offset = Math.sin(platform.moveTimer * 0.02) * (platform.moveRange || 60);
+                platform.y = platform.origY + offset;
+            } else {
+                platform.vx = 0;
+            }
+        }
+        
+        // Update projectiles
+        for (let p of projectiles) p.update();
+        projectiles = projectiles.filter(p => !p.dead);
+        
         player.update();
         
         for (let enemy of currentLevelData.enemies) {
             enemy.update();
         }
         
-        // Check boss defeat (spawn exit or trigger victory)
+        // Check boss defeat
         let bossEnemy = currentLevelData.enemies.find(e => e.type === 'boss' || e.type === 'finalboss');
         if (bossEnemy && bossEnemy.dead && !bossEnemy._victoryTriggered) {
             bossEnemy._victoryTriggered = true;
             if (currentLevel === LEVELS.length - 1) {
+                SoundFX.victory();
                 setTimeout(() => { gameState = 'VICTORY'; }, 1000);
             } else if (!currentLevelData.exit) {
-                // Spawn exit on the right platform
                 currentLevelData.exit = { x: 660, y: 410, width: 40, height: 50 };
+                SoundFX.collect();
             }
         }
     }
