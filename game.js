@@ -197,8 +197,16 @@ class Player {
         
         if (keys['ArrowUp']) {
             if (this.inWater) {
-                this.vy = SWIM_FORCE;
+                // Near surface → full jump out; deep → gentle swim
+                let nearSurface = false;
+                if (currentLevelData.water) {
+                    for (let w of currentLevelData.water) {
+                        if (this.y + this.height > w.y && this.y + this.height < w.y + 25) nearSurface = true;
+                    }
+                }
+                this.vy = nearSurface ? JUMP_FORCE : SWIM_FORCE;
                 this.grounded = false;
+                if (nearSurface) SoundFX.splash();
             } else if (this.grounded) {
                 this.vy = JUMP_FORCE;
                 this.grounded = false;
